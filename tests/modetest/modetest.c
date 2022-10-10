@@ -66,6 +66,7 @@
 
 #include "buffers.h"
 #include "cursor.h"
+#include "modetest.h"
 
 struct crtc {
 	drmModeCrtc *crtc;
@@ -1205,10 +1206,19 @@ static int set_plane(struct device *dev, struct plane_arg *p)
 
 	plane_bo = bo_create(dev->fd, p->fourcc, p->w, p->h, handles,
 			     pitches, offsets, UTIL_PATTERN_TILES);
-	if (plane_bo == NULL)
+	if (plane_bo == NULL) {
+		printf("set_plane() plane_bo->ptr = %p\n", plane_bo);
 		return -1;
+	}
 
 	p->bo = plane_bo;
+
+	/* LEON */
+	printf("set_plane() plane_bo->ptr = %p\n", plane_bo);
+	void *virtual;
+	int ret = bo_map(plane_bo, &virtual);
+	printf("ret = %d\n", ret);
+	bo_unmap(plane_bo);
 
 	/* just use single plane format for now.. */
 	if (drmModeAddFB2(dev->fd, p->w, p->h, p->fourcc,
@@ -1818,10 +1828,337 @@ static int pipe_resolve_connectors(struct device *dev, struct pipe_arg *pipe)
 	return 0;
 }
 
+struct modetest_state {
+	struct device dev;
+	struct pipe_arg *pipe_args;
+	struct plane_arg *plane_args;
+	struct property_arg *prop_args;
+	unsigned int count;
+	unsigned int plane_count;
+	int drop_master;
+	int test_vsync;
+	int test_cursor;
+};
+
+const char *hardcoded[2] = {
+		{"~/sandbox/htj2k/libdrm/tests/modetest/modetest"},
+		{"-M xlnx -s 43:1920x1080@RG16 -P 39@41:1920x1080@YUYV -w 40:alpha:40"},
+};
+
 static char optstr[] = "acdD:efM:P:ps:Cvw:";
+
+/* LEON
+ * setup and teardown are main() but split in half, with state
+ * shared out of setup() for re-entry into teardown() later.
+ */
+
+void *setup(int argc, char **argv)
+{
+	struct device dev;
+
+	int c;
+	int encoders = 0, connectors = 0, crtcs = 0, planes = 0, framebuffers = 0;
+	int drop_master = 0;
+	int test_vsync = 0;
+	int test_cursor = 0;
+	int use_atomic = 0;
+	char *device = NULL;
+	char *module = NULL;
+	unsigned int i;
+	unsigned int count = 0, plane_count = 0;
+	unsigned int prop_count = 0;
+	struct pipe_arg *pipe_args = NULL;
+	struct plane_arg *plane_args = NULL;
+	struct property_arg *prop_args = NULL;
+	unsigned int args = 0;
+	int ret;
+
+	/* do main up and including */
+
+	memset(&dev, 0, sizeof dev);
+
+	opterr = 0;
+	while ((c = getopt(argc, argv, optstr)) != -1) {
+		args++;
+
+		switch (c) {
+		case 'a':
+			use_atomic = 1;
+			break;
+		case 'c':
+			connectors = 1;
+			break;
+		case 'D':
+			device = optarg;
+			args--;
+			break;
+		case 'd':
+			drop_master = 1;
+			break;
+		case 'e':
+			encoders = 1;
+			break;
+		case 'f':
+			framebuffers = 1;
+			break;
+		case 'M':
+			module = optarg;
+			/* Preserve the default behaviour of dumping all information. */
+			args--;
+			break;
+		case 'P':
+			plane_args = realloc(plane_args,
+					     (plane_count + 1) * sizeof *plane_args);
+			if (plane_args == NULL) {
+				fprintf(stderr, "memory allocation failed\n");
+				return NULL;
+			}
+			memset(&plane_args[plane_count], 0, sizeof(*plane_args));
+
+			if (parse_plane(&plane_args[plane_count], optarg) < 0)
+				usage(argv[0]);
+
+			plane_count++;
+			break;
+		case 'p':
+			crtcs = 1;
+			planes = 1;
+			break;
+		case 's':
+			pipe_args = realloc(pipe_args,
+					    (count + 1) * sizeof *pipe_args);
+			if (pipe_args == NULL) {
+				fprintf(stderr, "memory allocation failed\n");
+				return NULL;
+			}
+			memset(&pipe_args[count], 0, sizeof(*pipe_args));
+
+			if (parse_connector(&pipe_args[count], optarg) < 0)
+				usage(argv[0]);
+
+			count++;
+			break;
+		case 'C':
+			test_cursor = 1;
+			break;
+		case 'v':
+			test_vsync = 1;
+			break;
+		case 'w':
+			prop_args = realloc(prop_args,
+					   (prop_count + 1) * sizeof *prop_args);
+			if (prop_args == NULL) {
+				fprintf(stderr, "memory allocation failed\n");
+				return NULL;
+			}
+			memset(&prop_args[prop_count], 0, sizeof(*prop_args));
+
+			if (parse_property(&prop_args[prop_count], optarg) < 0)
+				usage(argv[0]);
+
+			prop_count++;
+			break;
+		default:
+			usage(argv[0]);
+			break;
+		}
+	}
+
+	if (!args || (args == 1 && use_atomic))
+		encoders = connectors = crtcs = planes = framebuffers = 1;
+
+	dev.fd = util_open(device, module);
+	if (dev.fd < 0)
+		return NULL;
+
+	ret = drmSetClientCap(dev.fd, DRM_CLIENT_CAP_ATOMIC, 1);
+	if (ret && use_atomic) {
+		fprintf(stderr, "no atomic modesetting support: %s\n", strerror(errno));
+		drmClose(dev.fd);
+		return NULL;
+	}
+
+	dev.use_atomic = use_atomic;
+
+	if (test_vsync && !page_flipping_supported()) {
+		fprintf(stderr, "page flipping not supported by drm.\n");
+		return NULL;
+	}
+
+	if (test_vsync && !count) {
+		fprintf(stderr, "page flipping requires at least one -s option.\n");
+		return NULL;
+	}
+
+	if (test_cursor && !cursor_supported()) {
+		fprintf(stderr, "hw cursor not supported by drm.\n");
+		return NULL;
+	}
+
+	dev.resources = get_resources(&dev);
+	if (!dev.resources) {
+		drmClose(dev.fd);
+		return NULL;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (pipe_resolve_connectors(&dev, &pipe_args[i]) < 0) {
+			free_resources(dev.resources);
+			drmClose(dev.fd);
+			return NULL;
+		}
+	}
+
+#define dump_resource(dev, res) if (res) dump_##res(dev)
+
+	dump_resource(&dev, encoders);
+	dump_resource(&dev, connectors);
+	dump_resource(&dev, crtcs);
+	dump_resource(&dev, planes);
+	dump_resource(&dev, framebuffers);
+
+	for (i = 0; i < prop_count; ++i)
+		set_property(&dev, &prop_args[i]);
+
+	if (dev.use_atomic) {
+		dev.req = drmModeAtomicAlloc();
+
+		if (count && plane_count) {
+			uint64_t cap = 0;
+
+			ret = drmGetCap(dev.fd, DRM_CAP_DUMB_BUFFER, &cap);
+			if (ret || cap == 0) {
+				fprintf(stderr, "driver doesn't support the dumb buffer API\n");
+				return NULL;
+			}
+
+			atomic_set_mode(&dev, pipe_args, count);
+			atomic_set_planes(&dev, plane_args, plane_count, false);
+
+			ret = drmModeAtomicCommit(dev.fd, dev.req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+			if (ret) {
+				fprintf(stderr, "Atomic Commit failed [1]\n");
+				return NULL;
+			}
+
+			gettimeofday(&pipe_args->start, NULL);
+			pipe_args->swap_count = 0;
+
+			while (test_vsync) {
+				drmModeAtomicFree(dev.req);
+				dev.req = drmModeAtomicAlloc();
+				atomic_set_planes(&dev, plane_args, plane_count, true);
+
+				ret = drmModeAtomicCommit(dev.fd, dev.req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+				if (ret) {
+					fprintf(stderr, "Atomic Commit failed [2]\n");
+					return NULL;
+				}
+
+				pipe_args->swap_count++;
+				if (pipe_args->swap_count == 60) {
+					struct timeval end;
+					double t;
+
+					gettimeofday(&end, NULL);
+					t = end.tv_sec + end.tv_usec * 1e-6 -
+				    (pipe_args->start.tv_sec + pipe_args->start.tv_usec * 1e-6);
+					fprintf(stderr, "freq: %.02fHz\n", pipe_args->swap_count / t);
+					pipe_args->swap_count = 0;
+					pipe_args->start = end;
+				}
+			}
+
+			if (drop_master)
+				drmDropMaster(dev.fd);
+
+			getchar();
+
+			drmModeAtomicFree(dev.req);
+			dev.req = drmModeAtomicAlloc();
+
+			atomic_clear_mode(&dev, pipe_args, count);
+			atomic_clear_planes(&dev, plane_args, plane_count);
+			ret = drmModeAtomicCommit(dev.fd, dev.req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+			if (ret) {
+				fprintf(stderr, "Atomic Commit failed\n");
+				return NULL;
+			}
+
+			atomic_clear_FB(&dev, plane_args, plane_count);
+		}
+
+		drmModeAtomicFree(dev.req);
+	} else {
+		if (count || plane_count) {
+			uint64_t cap = 0;
+
+			ret = drmGetCap(dev.fd, DRM_CAP_DUMB_BUFFER, &cap);
+			if (ret || cap == 0) {
+				fprintf(stderr, "driver doesn't support the dumb buffer API\n");
+				return NULL;
+			}
+
+			if (count)
+				set_mode(&dev, pipe_args, count);
+
+			if (plane_count) {
+				set_planes(&dev, plane_args, plane_count);
+
+				void *virtual;
+				int rc = bo_map(plane_args[0].bo, &virtual);
+				printf("bo_map = %d, virtual = %p\n", rc, virtual);
+				bo_unmap(plane_args[0].bo);
+				struct modetest_state *state;
+				state = malloc(sizeof(struct modetest_state));
+				state->pipe_args = pipe_args;
+				state->plane_args = plane_args;
+				state->plane_count = plane_count;
+				state->count = count;
+
+				state->drop_master = drop_master;
+				state->test_vsync = test_vsync;
+				state->test_cursor = test_cursor;
+
+				return (void *)state;
+			}
+		}
+	}
+	return NULL;
+}
+
+void teardown(void *state_ptr)
+{
+	struct modetest_state *state = (struct modetest_state *)state_ptr;
+	if (state->test_cursor)
+		set_cursors(&state->dev, state->pipe_args, state->count);
+
+	if (state->test_vsync)
+		test_page_flip(&state->dev, state->pipe_args, state->count);
+
+	if (state->drop_master)
+		drmDropMaster(state->dev.fd);
+
+	getchar();
+
+	if (state->test_cursor)
+		clear_cursors(&state->dev);
+
+	if (state->plane_count)
+		clear_planes(&state->dev, state->plane_args, state->plane_count);
+
+	if (state->count)
+		clear_mode(&state->dev);
+}
 
 int main(int argc, char **argv)
 {
+
+	void *ptr = setup(argc, argv);
+	if (ptr)
+		teardown(ptr);
+	exit(0);
+
 	struct device dev;
 
 	int c;
@@ -2068,8 +2405,14 @@ int main(int argc, char **argv)
 			if (count)
 				set_mode(&dev, pipe_args, count);
 
-			if (plane_count)
+			if (plane_count) {
 				set_planes(&dev, plane_args, plane_count);
+
+				void *virtual;
+				int rc = bo_map(plane_args[0].bo, &virtual);
+				printf("bo_map = %d, virtual = %p\n", rc, virtual);
+				bo_unmap(plane_args[0].bo);
+			}
 
 			if (test_cursor)
 				set_cursors(&dev, pipe_args, count);

@@ -29,12 +29,24 @@
 
 #include "util/pattern.h"
 
-struct bo;
+//struct bo;
+struct bo
+{
+	int fd;
+	void *ptr;
+	size_t size;
+	size_t offset;
+	size_t pitch;
+	unsigned handle;
+};
 
 struct bo *bo_create(int fd, unsigned int format,
 		   unsigned int width, unsigned int height,
 		   unsigned int handles[4], unsigned int pitches[4],
 		   unsigned int offsets[4], enum util_fill_pattern pattern);
 void bo_destroy(struct bo *bo);
+
+void bo_unmap(struct bo *bo);
+int bo_map(struct bo *bo, void **out);
 
 #endif

@@ -40,16 +40,6 @@
 
 #include "buffers.h"
 
-struct bo
-{
-	int fd;
-	void *ptr;
-	size_t size;
-	size_t offset;
-	size_t pitch;
-	unsigned handle;
-};
-
 /* -----------------------------------------------------------------------------
  * Buffers management
  */
@@ -88,7 +78,7 @@ bo_create_dumb(int fd, unsigned int width, unsigned int height, unsigned int bpp
 	return bo;
 }
 
-static int bo_map(struct bo *bo, void **out)
+int bo_map(struct bo *bo, void **out)
 {
 	struct drm_mode_map_dumb arg;
 	void *map;
@@ -112,7 +102,7 @@ static int bo_map(struct bo *bo, void **out)
 	return 0;
 }
 
-static void bo_unmap(struct bo *bo)
+void bo_unmap(struct bo *bo)
 {
 	if (!bo->ptr)
 		return;
@@ -133,6 +123,8 @@ bo_create(int fd, unsigned int format,
 	void *planes[3] = { 0, };
 	void *virtual;
 	int ret;
+
+	printf("bo_create(format=0x%08x\n", format);
 
 	switch (format) {
 	case DRM_FORMAT_NV12:
