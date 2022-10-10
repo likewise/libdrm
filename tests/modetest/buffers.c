@@ -311,6 +311,8 @@ bo_create(int fd, unsigned int format,
 		break;
 	}
 
+	printf("pitches[0] = %u\n", pitches[0]);
+
 	util_fill_pattern(format, pattern, planes, width, height, pitches[0]);
 	bo_unmap(bo);
 

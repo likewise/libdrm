@@ -1840,9 +1840,9 @@ struct modetest_state {
 	int test_cursor;
 };
 
-const char *hardcoded[2] = {
-		{"~/sandbox/htj2k/libdrm/tests/modetest/modetest"},
-		{"-M xlnx -s 43:1920x1080@RG16 -P 39@41:1920x1080@YUYV -w 40:alpha:40"},
+const char *hardcoded[] = {
+		"~/sandbox/htj2k/libdrm/tests/modetest/modetest",
+		"-M" , "xlnx", "-s", "43:1920x1080@RG16", "-P", "39@41:1920x1080@YV12", "-w", "40:alpha:40",
 };
 
 static char optstr[] = "acdD:efM:P:ps:Cvw:";
@@ -1852,7 +1852,7 @@ static char optstr[] = "acdD:efM:P:ps:Cvw:";
  * shared out of setup() for re-entry into teardown() later.
  */
 
-void *setup(int argc, char **argv)
+void *setup(int argc, char **argv, void **virtual_ptr)
 {
 	struct device dev;
 
@@ -2105,12 +2105,12 @@ void *setup(int argc, char **argv)
 			if (plane_count) {
 				set_planes(&dev, plane_args, plane_count);
 
-				void *virtual;
+				void *virtual = NULL;
 				int rc = bo_map(plane_args[0].bo, &virtual);
-				printf("bo_map = %d, virtual = %p\n", rc, virtual);
-				bo_unmap(plane_args[0].bo);
+				printf("setup() bo_map = %d, virtual = %p\n", rc, virtual);
 				struct modetest_state *state;
 				state = malloc(sizeof(struct modetest_state));
+				printf("setup() state = %p\n", state);
 				state->pipe_args = pipe_args;
 				state->plane_args = plane_args;
 				state->plane_count = plane_count;
@@ -2120,6 +2120,9 @@ void *setup(int argc, char **argv)
 				state->test_vsync = test_vsync;
 				state->test_cursor = test_cursor;
 
+				*virtual_ptr = virtual;
+				printf("setup() state = %p\n", state);
+				printf("setup() *virtual_ptr = %p\n", *virtual_ptr);
 				return (void *)state;
 			}
 		}
@@ -2130,6 +2133,10 @@ void *setup(int argc, char **argv)
 void teardown(void *state_ptr)
 {
 	struct modetest_state *state = (struct modetest_state *)state_ptr;
+
+	if (!state)
+		return;
+
 	if (state->test_cursor)
 		set_cursors(&state->dev, state->pipe_args, state->count);
 
@@ -2141,6 +2148,9 @@ void teardown(void *state_ptr)
 
 	getchar();
 
+	if (state->plane_args && state->plane_args[0].bo)
+		bo_unmap(state->plane_args[0].bo);
+
 	if (state->test_cursor)
 		clear_cursors(&state->dev);
 
@@ -2151,12 +2161,37 @@ void teardown(void *state_ptr)
 		clear_mode(&state->dev);
 }
 
+void *hardcoded_setup(void **virtual_ptr)
+{
+	int argc;
+	char **argv;
+
+	argv = hardcoded;
+	argc = sizeof(hardcoded) / sizeof(char *);
+	void *state = setup(argc, argv, virtual_ptr);
+	printf("hardcoded_setup() *virtual_ptr = %p\n", *virtual_ptr);
+	return state;
+}
+
+#ifndef OJPH_ENABLE_MODETEST
 int main(int argc, char **argv)
 {
+	void *virtual = NULL;
 
-	void *ptr = setup(argc, argv);
-	if (ptr)
-		teardown(ptr);
+	argv = hardcoded;
+	argc = sizeof(hardcoded) / sizeof(char *);
+	printf("sizeof(hardcoded) = %d\n", sizeof(hardcoded) / sizeof(char *));
+	//void *state = setup(argc, argv, &virtual);
+	void *state = setup(argc, argv, &virtual);
+	if (state) {
+		printf("main() state = %p, virtual = %p\n", state, virtual);
+		for (int i = 0; i < 1920 * 4; i++) {
+			uint32_t *ptr = (uint32_t *)virtual;
+			ptr[i] = 0x11111111U;
+		}
+		//if (virtual) memset(virtual, 0xFF, 1920*1080*4);
+		if (state) teardown(state);
+	}
 	exit(0);
 
 	struct device dev;
@@ -2408,7 +2443,6 @@ int main(int argc, char **argv)
 			if (plane_count) {
 				set_planes(&dev, plane_args, plane_count);
 
-				void *virtual;
 				int rc = bo_map(plane_args[0].bo, &virtual);
 				printf("bo_map = %d, virtual = %p\n", rc, virtual);
 				bo_unmap(plane_args[0].bo);
@@ -2440,3 +2474,4 @@ int main(int argc, char **argv)
 
 	return 0;
 }
+#endif
